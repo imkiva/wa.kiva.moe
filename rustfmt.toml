@@ -1,0 +1,8 @@
+reorder_modules = true
+reorder_imports = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+wrap_comments = true
+trailing_semicolon = true
+newline_style = "Unix"
+tab_spaces = 2
