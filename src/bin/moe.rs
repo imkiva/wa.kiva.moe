@@ -82,9 +82,19 @@ async fn bv_resolver(bv: String, p: usize) -> anyhow::Result<Redirect> {
     Some(x) => x.to_string(),
     None => bail!("Failed to get cid from response: {}", cid),
   };
+  // https://www.bilibili.com/opus/400555526268551002
+  // quality 120 = 4K
+  // quality 116 = 1080P60
+  // quality 112 = 1080P+
+  // quality 80 = 1080P
+  // quality 74 = 720P60
+  // quality 64 = 720P
+  // quality 32 = 480P
+  // quality 16 = 360P
+  let quality = 116;
   let playurl = match client.get(format!(
-    "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=116&type=&otype=json&platform=html5&high_quality=1",
-    bv, cid
+    "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn={}&type=&otype=json&platform=html5&high_quality=1",
+    bv, cid, quality,
   ))
     .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
     .header("Accept-Language", "zh-CN,zh;q=0.9")
