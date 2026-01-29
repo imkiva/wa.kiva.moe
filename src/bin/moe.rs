@@ -1,3 +1,4 @@
+use std::time::Duration;
 use anyhow::{anyhow, bail};
 use axum::extract::Path;
 use axum::http::StatusCode;
@@ -6,6 +7,7 @@ use axum::{Router, response::Html, routing::get};
 use clap::Parser;
 use serde::Deserialize;
 use w_kiva_moe::AppOpts;
+use w_kiva_moe::video_gw::VideoGateway;
 
 // Make our own error that wraps `anyhow::Error`.
 struct AppError(anyhow::Error);
@@ -138,6 +140,7 @@ async fn main() {
     .init();
 
   let opts = AppOpts::parse();
+  let video_gw = VideoGateway::new(10000, Duration::from_secs(1200));
 
   // build our application with a route
   let app = Router::new()
@@ -161,7 +164,8 @@ async fn main() {
           Ok(bv_resolver(params.bvid.clone(), p).await?)
         },
       ),
-    );
+    )
+    .nest("/video-gw", w_kiva_moe::video_gw::router(video_gw));
 
   // run it
   let listener = tokio::net::TcpListener::bind(opts.listen).await.unwrap();
