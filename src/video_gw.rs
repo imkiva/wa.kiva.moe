@@ -74,7 +74,8 @@ impl VideoGateway {
     let slot_id = guard.pop_front()?;
     drop(guard);
 
-    self.cache.insert(slot_id, url).await;
+    self.cache.insert(slot_id, url.clone()).await;
+    log::info!("Slot {} created, {}", slot_id, url);
     Some(slot_id)
   }
 
