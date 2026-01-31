@@ -93,6 +93,10 @@ impl VideoGateway {
     }
   }
 
+  pub async fn clear_all_redirect(&self) {
+    self.cache.invalidate_all();
+  }
+
   pub async fn get_redirect(&self, slot_id: SlotId) -> Option<String> {
     self.cache.get(&slot_id).await
   }
@@ -167,11 +171,19 @@ pub async fn batch_touch_redirect_handler(
   Ok(StatusCode::OK)
 }
 
+pub async fn clear_all_redirect_handler(
+  State(gateway): State<Arc<VideoGateway>>,
+) -> Result<StatusCode, StatusCode> {
+  gateway.clear_all_redirect().await;
+  Ok(StatusCode::OK)
+}
+
 pub fn router(gateway: Arc<VideoGateway>) -> Router {
   Router::new()
     .route("/redirect", post(create_redirect_handler))
     .route("/redirect", get(get_all_redirect_handler))
     .route("/redirect/{slot_id}", get(get_redirect_handler))
     .route("/redirect/touch", post(batch_touch_redirect_handler))
+    .route("/redirect/clear", post(clear_all_redirect_handler))
     .with_state(gateway)
 }
