@@ -94,6 +94,7 @@ impl VideoGateway {
   }
 
   pub async fn clear_all_redirect(&self) {
+    log::info!("Clearing all redirect slots");
     self.cache.invalidate_all();
   }
 
