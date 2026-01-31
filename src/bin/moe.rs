@@ -140,7 +140,7 @@ async fn main() {
     .init();
 
   let opts = AppOpts::parse();
-  let video_gw = VideoGateway::new(10000, Duration::from_secs(1200));
+  let video_gw = VideoGateway::new(3, Duration::from_secs(10));
 
   // build our application with a route
   let app = Router::new()

@@ -13,6 +13,7 @@ use std::{
   time::Duration,
 };
 use axum::response::Redirect;
+use moka::notification::RemovalCause;
 use tokio::sync::Mutex;
 
 pub type SlotId = u32;
@@ -37,7 +38,13 @@ impl VideoGateway {
     let cache = Cache::builder()
       .max_capacity(max_slots as u64)
       .time_to_live(ttl)
-      .eviction_listener(move |slot_id, _value, _cause| {
+      .eviction_listener(move |slot_id, _value, cause| {
+        match cause {
+          RemovalCause::Replaced => return,
+          RemovalCause::Expired => {}
+          RemovalCause::Explicit => {}
+          RemovalCause::Size => {}
+        }
         let free_slots_for_eviction = free_slots_for_eviction.clone();
         tokio::spawn(async move {
           let mut guard = free_slots_for_eviction.lock().await;
@@ -79,6 +86,13 @@ impl VideoGateway {
     Some(slot_id)
   }
 
+  pub async fn touch_redirect_slot(&self, slot_id: SlotId) {
+    if let Some(url) = self.cache.get(&slot_id).await {
+      self.cache.insert(slot_id, url.clone()).await;
+      log::info!("Slot {} touched, {}", slot_id, url);
+    }
+  }
+
   pub async fn get_redirect(&self, slot_id: SlotId) -> Option<String> {
     self.cache.get(&slot_id).await
   }
@@ -107,6 +121,11 @@ pub struct GetRedirectResponse {
 #[derive(Debug, Serialize)]
 pub struct GetAllRedirectResponse {
   pub map: Vec<RedirectEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchTouchRequest {
+  pub slot_ids: Vec<SlotId>,
 }
 
 pub async fn create_redirect_handler(
@@ -138,10 +157,21 @@ pub async fn get_all_redirect_handler(
   }
 }
 
+pub async fn batch_touch_redirect_handler(
+  State(gateway): State<Arc<VideoGateway>>,
+  Json(req): Json<BatchTouchRequest>,
+) -> Result<StatusCode, StatusCode> {
+  for slot_id in req.slot_ids {
+    gateway.touch_redirect_slot(slot_id).await;
+  }
+  Ok(StatusCode::OK)
+}
+
 pub fn router(gateway: Arc<VideoGateway>) -> Router {
   Router::new()
     .route("/redirect", post(create_redirect_handler))
     .route("/redirect", get(get_all_redirect_handler))
     .route("/redirect/{slot_id}", get(get_redirect_handler))
+    .route("/redirect/touch", post(batch_touch_redirect_handler))
     .with_state(gateway)
 }
