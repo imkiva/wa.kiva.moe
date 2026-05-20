@@ -2,11 +2,11 @@ use anyhow::{anyhow, bail};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::{Router, response::Html, routing::get};
+use axum::{Json, Router, response::Html, routing::get};
 use clap::Parser;
 use moka::future::Cache;
-use serde::Deserialize;
-use std::{sync::Arc, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use w_kiva_moe::AppOpts;
 use w_kiva_moe::video_gw::VideoGateway;
 
@@ -48,10 +48,23 @@ struct ResolveCacheKey {
 }
 
 #[derive(Clone)]
+struct ResolvedPlayurl {
+  url: String,
+  quality: u64,
+}
+
+#[derive(Serialize)]
+struct DebugBvResolverEntry {
+  p: usize,
+  url: String,
+  quality: u64,
+}
+
+#[derive(Clone)]
 struct BvResolver {
   client: reqwest::Client,
   quality_cache: Cache<String, u64>,
-  resolve_cache: Cache<ResolveCacheKey, String>,
+  resolve_cache: Cache<ResolveCacheKey, ResolvedPlayurl>,
 }
 
 impl BvResolver {
@@ -77,7 +90,7 @@ impl BvResolver {
     let cache_key = ResolveCacheKey { bvid: bv, p };
     let init_key = cache_key.clone();
 
-    let url = match self
+    let resolved = match self
       .resolve_cache
       .try_get_with(
         cache_key,
@@ -85,14 +98,14 @@ impl BvResolver {
       )
       .await
     {
-      Ok(url) => url,
+      Ok(resolved) => resolved,
       Err(e) => return Ok(format!("{}: {}", RESOLVE_FAILURE_MESSAGE, e.as_ref()).into_response()),
     };
 
-    Ok(Redirect::temporary(url.as_str()).into_response())
+    Ok(Redirect::temporary(resolved.url.as_str()).into_response())
   }
 
-  async fn resolve_uncached(&self, cache_key: &ResolveCacheKey) -> anyhow::Result<String> {
+  async fn resolve_uncached(&self, cache_key: &ResolveCacheKey) -> anyhow::Result<ResolvedPlayurl> {
     let cid = match with_bilibili_headers(self.client.get(format!(
       "https://api.bilibili.com/x/player/pagelist?bvid={}",
       cache_key.bvid
@@ -141,7 +154,7 @@ impl BvResolver {
     self.resolve_playurl(&cache_key.bvid, &cid).await
   }
 
-  async fn resolve_playurl(&self, bv: &str, cid: &str) -> anyhow::Result<String> {
+  async fn resolve_playurl(&self, bv: &str, cid: &str) -> anyhow::Result<ResolvedPlayurl> {
     let preferred_quality = self.quality_cache.get(bv).await.unwrap_or(DEFAULT_QUALITY);
     let mut tried_qualities = Vec::new();
     let mut errors = Vec::new();
@@ -191,7 +204,10 @@ impl BvResolver {
             .quality_cache
             .insert(bv.to_string(), first_quality)
             .await;
-          return Ok(url);
+          return Ok(ResolvedPlayurl {
+            url,
+            quality: first_quality,
+          });
         }
         Err(e) => {
           errors.push(format!("quality {} HEAD failed: {}", first_quality, e));
@@ -245,7 +261,7 @@ impl BvResolver {
       match validate_video_url(&self.client, &url).await {
         Ok(()) => {
           self.quality_cache.insert(bv.to_string(), quality).await;
-          return Ok(url);
+          return Ok(ResolvedPlayurl { url, quality });
         }
         Err(e) => {
           errors.push(format!("quality {} HEAD failed: {}", quality, e));
@@ -260,6 +276,46 @@ impl BvResolver {
 
     bail!("{}", errors.join("; "))
   }
+
+  async fn debug_entries(&self) -> BTreeMap<String, Vec<DebugBvResolverEntry>> {
+    self.resolve_cache.run_pending_tasks().await;
+
+    let mut entries = BTreeMap::<String, Vec<DebugBvResolverEntry>>::new();
+
+    for (key, resolved) in self.resolve_cache.iter() {
+      entries
+        .entry(key.bvid.clone())
+        .or_default()
+        .push(DebugBvResolverEntry {
+          p: key.p,
+          url: resolved.url.clone(),
+          quality: resolved.quality,
+        });
+    }
+
+    for value in entries.values_mut() {
+      value.sort_by_key(|entry| entry.p);
+    }
+    entries
+  }
+
+  async fn clear_caches(&self) {
+    self.quality_cache.invalidate_all();
+    self.resolve_cache.invalidate_all();
+    self.quality_cache.run_pending_tasks().await;
+    self.resolve_cache.run_pending_tasks().await;
+  }
+}
+
+async fn debug_bv_resolvers_handler(
+  State(resolver): State<Arc<BvResolver>>,
+) -> Json<BTreeMap<String, Vec<DebugBvResolverEntry>>> {
+  Json(resolver.debug_entries().await)
+}
+
+async fn debug_bv_resolvers_clear_handler(State(resolver): State<Arc<BvResolver>>) -> StatusCode {
+  resolver.clear_caches().await;
+  StatusCode::OK
 }
 
 fn with_bilibili_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -361,6 +417,11 @@ async fn main() {
   let video_gw = VideoGateway::new(10000, Duration::from_secs(1800));
 
   let bv_router = Router::new()
+    .route("/debug/bvresolvers", get(debug_bv_resolvers_handler))
+    .route(
+      "/debug/bvresolvers-clear",
+      get(debug_bv_resolvers_clear_handler),
+    )
     .route(
       "/{bvid}",
       get(
