@@ -1,4 +1,3 @@
-use std::time::Duration;
 use anyhow::{anyhow, bail};
 use axum::extract::Path;
 use axum::http::StatusCode;
@@ -6,6 +5,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Router, response::Html, routing::get};
 use clap::Parser;
 use serde::Deserialize;
+use std::time::Duration;
 use w_kiva_moe::AppOpts;
 use w_kiva_moe::video_gw::VideoGateway;
 
@@ -15,11 +15,7 @@ struct AppError(anyhow::Error);
 // Tell axum how to convert `AppError` into a response.
 impl IntoResponse for AppError {
   fn into_response(self) -> Response {
-    (
-      StatusCode::INTERNAL_SERVER_ERROR,
-      self.0.to_string(),
-    )
-      .into_response()
+    (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
   }
 }
 
@@ -38,16 +34,11 @@ struct BvResolverParam {
   pub p: Option<usize>,
 }
 
-async fn bv_resolver(bv: String, p: usize) -> anyhow::Result<Redirect> {
-  let client = reqwest::Client::builder()
-    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-    .build()
-    .map_err(|e| anyhow!(e))?;
+const DEFAULT_QUALITY: u64 = 116;
+const RESOLVE_FAILURE_MESSAGE: &str = "小袜子无法解析喵";
 
-  let cid = match client.get(format!(
-    "https://api.bilibili.com/x/player/pagelist?bvid={}",
-    bv
-  ))
+fn with_bilibili_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+  request
     .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
     .header("Accept-Language", "zh-CN,zh;q=0.9")
     .header("Cache-Control", "no-cache")
@@ -59,7 +50,142 @@ async fn bv_resolver(bv: String, p: usize) -> anyhow::Result<Redirect> {
     .header("Sec-Fetch-Site", "none")
     .header("Sec-Fetch-User", "?1")
     .header("Upgrade-Insecure-Requests", "1")
-    .send().await {
+}
+
+async fn request_playurl(
+  client: &reqwest::Client,
+  bv: &str,
+  cid: &str,
+  quality: u64,
+) -> anyhow::Result<serde_json::Value> {
+  let playurl = match with_bilibili_headers(client.get(format!(
+    "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn={}&type=&otype=json&platform=html5&high_quality=1",
+    bv, cid, quality,
+  )))
+  .send()
+  .await
+  {
+    Ok(x) => x,
+    Err(e) => bail!("Failed to get playurl: {}", e),
+  };
+  let strings = match playurl.text().await {
+    Ok(x) => x,
+    Err(e) => bail!("Failed to parse playurl response as UTF8: {}", e),
+  };
+  match serde_json::from_str::<serde_json::Value>(&strings) {
+    Ok(x) => Ok(x),
+    Err(_) => bail!("Failed to parse playurl response: {}", &strings),
+  }
+}
+
+fn extract_durl_url(json: &serde_json::Value) -> Option<String> {
+  json["data"]["durl"][0]["url"]
+    .as_str()
+    .map(ToString::to_string)
+}
+
+fn extract_accept_quality(json: &serde_json::Value) -> Vec<u64> {
+  json["data"]["accept_quality"]
+    .as_array()
+    .map(|qualities| {
+      qualities
+        .iter()
+        .filter_map(|quality| {
+          quality
+            .as_u64()
+            .or_else(|| quality.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+async fn is_video_url_head_ok(client: &reqwest::Client, url: &str) -> bool {
+  match client
+    .head(url)
+    .header("Accept", "*/*")
+    .header("Referer", "https://www.bilibili.com/")
+    .send()
+    .await
+  {
+    Ok(response) => {
+      let status = response.status();
+      if !status.is_success() {
+        log::warn!("HEAD check failed with status {}", status);
+      }
+      status.is_success()
+    }
+    Err(e) => {
+      log::warn!("HEAD check failed: {}", e);
+      false
+    }
+  }
+}
+
+async fn resolve_playurl(client: &reqwest::Client, bv: &str, cid: &str) -> Option<String> {
+  let first_playurl = match request_playurl(client, bv, cid, DEFAULT_QUALITY).await {
+    Ok(x) => x,
+    Err(e) => {
+      log::warn!(
+        "Failed to get playurl for quality {}: {}",
+        DEFAULT_QUALITY,
+        e
+      );
+      return None;
+    }
+  };
+
+  if let Some(url) = extract_durl_url(&first_playurl) {
+    if is_video_url_head_ok(client, &url).await {
+      return Some(url);
+    }
+  } else {
+    log::warn!(
+      "Failed to parse .data.durl[0].url from {} quality playurl response",
+      DEFAULT_QUALITY
+    );
+  }
+
+  for quality in extract_accept_quality(&first_playurl) {
+    if quality == DEFAULT_QUALITY {
+      continue;
+    }
+
+    let playurl = match request_playurl(client, bv, cid, quality).await {
+      Ok(x) => x,
+      Err(e) => {
+        log::warn!("Failed to get playurl for quality {}: {}", quality, e);
+        continue;
+      }
+    };
+    let Some(url) = extract_durl_url(&playurl) else {
+      log::warn!(
+        "Failed to parse .data.durl[0].url from {} quality playurl response",
+        quality
+      );
+      continue;
+    };
+    if is_video_url_head_ok(client, &url).await {
+      return Some(url);
+    }
+  }
+
+  None
+}
+
+async fn bv_resolver(bv: String, p: usize) -> anyhow::Result<Response> {
+  let client = reqwest::Client::builder()
+    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+    .build()
+    .map_err(|e| anyhow!(e))?;
+
+  let cid = match with_bilibili_headers(client.get(format!(
+    "https://api.bilibili.com/x/player/pagelist?bvid={}",
+    bv
+  )))
+  .send()
+  .await
+  {
     Ok(x) => x,
     Err(e) => bail!("Failed to get cid: {}", e),
   };
@@ -93,39 +219,10 @@ async fn bv_resolver(bv: String, p: usize) -> anyhow::Result<Redirect> {
   // quality 64 = 720P
   // quality 32 = 480P
   // quality 16 = 360P
-  let quality = 116;
-  let playurl = match client.get(format!(
-    "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn={}&type=&otype=json&platform=html5&high_quality=1",
-    bv, cid, quality,
-  ))
-    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-    .header("Accept-Language", "zh-CN,zh;q=0.9")
-    .header("Cache-Control", "no-cache")
-    .header("DNT", "1")
-    .header("Pragma", "no-cache")
-    .header("Priority", "u=0, i")
-    .header("Sec-Fetch-Dest", "document")
-    .header("Sec-Fetch-Mode", "navigate")
-    .header("Sec-Fetch-Site", "none")
-    .header("Sec-Fetch-User", "?1")
-    .header("Upgrade-Insecure-Requests", "1")
-    .send().await {
-    Ok(x) => x,
-    Err(e) => bail!("Failed to get playurl: {}", e),
-  };
-  let strings = match playurl.text().await {
-    Ok(x) => x,
-    Err(e) => bail!("Failed to parse playurl response as UTF8: {}", e),
-  };
-  let json = match serde_json::from_str::<serde_json::Value>(&strings) {
-    Ok(x) => x,
-    Err(_) => bail!("Failed to parse playurl response: {}", &strings),
-  };
-  let url = json["data"]["durl"][0]["url"]
-    .as_str()
-    .ok_or_else(|| anyhow!("Failed to parse .data.durl[0].url"))?
-    .to_string();
-  Ok(Redirect::temporary(url.as_str()))
+  match resolve_playurl(&client, &bv, &cid).await {
+    Some(url) => Ok(Redirect::temporary(url.as_str()).into_response()),
+    None => Ok(RESOLVE_FAILURE_MESSAGE.into_response()),
+  }
 }
 
 #[tokio::main]
@@ -149,7 +246,7 @@ async fn main() {
     .route(
       "/{bvid}",
       get(
-        async move |params: Path<BvResolverParam>| -> Result<Redirect, AppError> {
+        async move |params: Path<BvResolverParam>| -> Result<Response, AppError> {
           Ok(bv_resolver(params.bvid.clone(), 1).await?)
         },
       ),
@@ -157,10 +254,8 @@ async fn main() {
     .route(
       "/{bvid}/{p}",
       get(
-        async move |params: Path<BvResolverParam>| -> Result<Redirect, AppError> {
-          let p = params
-            .p
-            .unwrap_or(1usize);
+        async move |params: Path<BvResolverParam>| -> Result<Response, AppError> {
+          let p = params.p.unwrap_or(1usize);
           Ok(bv_resolver(params.bvid.clone(), p).await?)
         },
       ),
