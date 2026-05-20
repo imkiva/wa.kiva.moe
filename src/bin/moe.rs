@@ -6,6 +6,7 @@ use axum::{Json, Router, response::Html, routing::get};
 use clap::Parser;
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
+use std::error::Error;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use w_kiva_moe::AppOpts;
 use w_kiva_moe::video_gw::VideoGateway;
@@ -53,6 +54,20 @@ struct ResolvedPlayurl {
   quality: u64,
 }
 
+#[derive(Debug)]
+struct UncachedPlayurl {
+  url: String,
+  reason: String,
+}
+
+impl std::fmt::Display for UncachedPlayurl {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{}", self.reason)
+  }
+}
+
+impl Error for UncachedPlayurl {}
+
 #[derive(Serialize)]
 struct DebugBvResolverEntry {
   p: usize,
@@ -99,7 +114,17 @@ impl BvResolver {
       .await
     {
       Ok(resolved) => resolved,
-      Err(e) => return Ok(format!("{}: {}", RESOLVE_FAILURE_MESSAGE, e.as_ref()).into_response()),
+      Err(e) => {
+        if let Some(uncached) = e.downcast_ref::<UncachedPlayurl>() {
+          log::warn!(
+            "All playurl HEAD checks failed; returning uncached first playurl: {}",
+            uncached.reason
+          );
+          return Ok(Redirect::temporary(uncached.url.as_str()).into_response());
+        }
+
+        return Ok(format!("{}: {}", RESOLVE_FAILURE_MESSAGE, e.as_ref()).into_response());
+      }
     };
 
     Ok(Redirect::temporary(resolved.url.as_str()).into_response())
@@ -196,8 +221,10 @@ impl BvResolver {
       };
 
     let mut should_sleep_before_next_head = false;
+    let mut uncached_first_url = None;
 
     if let Some(url) = extract_durl_url(&first_playurl) {
+      uncached_first_url = Some(url.clone());
       match validate_video_url(&self.client, &url).await {
         Ok(()) => {
           self
@@ -272,6 +299,16 @@ impl BvResolver {
 
     if errors.is_empty() {
       bail!("no quality candidates available");
+    }
+
+    if let Some(url) = uncached_first_url {
+      return Err(
+        UncachedPlayurl {
+          url,
+          reason: errors.join("; "),
+        }
+        .into(),
+      );
     }
 
     bail!("{}", errors.join("; "))
