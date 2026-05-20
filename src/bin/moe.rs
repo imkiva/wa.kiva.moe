@@ -1,11 +1,12 @@
 use anyhow::{anyhow, bail};
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Router, response::Html, routing::get};
 use clap::Parser;
+use moka::future::Cache;
 use serde::Deserialize;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use w_kiva_moe::AppOpts;
 use w_kiva_moe::video_gw::VideoGateway;
 
@@ -36,6 +37,230 @@ struct BvResolverParam {
 
 const DEFAULT_QUALITY: u64 = 116;
 const RESOLVE_FAILURE_MESSAGE: &str = "小袜子无法解析喵";
+const QUALITY_CACHE_CAPACITY: u64 = 1024;
+const RESOLVE_CACHE_CAPACITY: u64 = 1024;
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ResolveCacheKey {
+  bvid: String,
+  p: usize,
+}
+
+#[derive(Clone)]
+struct BvResolver {
+  client: reqwest::Client,
+  quality_cache: Cache<String, u64>,
+  resolve_cache: Cache<ResolveCacheKey, String>,
+}
+
+impl BvResolver {
+  fn new() -> anyhow::Result<Arc<Self>> {
+    let client = reqwest::Client::builder()
+      .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+      .build()
+      .map_err(|e| anyhow!(e))?;
+
+    Ok(Arc::new(Self {
+      client,
+      quality_cache: Cache::builder()
+        .max_capacity(QUALITY_CACHE_CAPACITY)
+        .build(),
+      resolve_cache: Cache::builder()
+        .max_capacity(RESOLVE_CACHE_CAPACITY)
+        .time_to_live(RESOLVE_CACHE_TTL)
+        .build(),
+    }))
+  }
+
+  async fn resolve(&self, bv: String, p: usize) -> anyhow::Result<Response> {
+    let cache_key = ResolveCacheKey { bvid: bv, p };
+    let init_key = cache_key.clone();
+
+    let url = match self
+      .resolve_cache
+      .try_get_with(
+        cache_key,
+        async move { self.resolve_uncached(&init_key).await },
+      )
+      .await
+    {
+      Ok(url) => url,
+      Err(e) => return Ok(format!("{}: {}", RESOLVE_FAILURE_MESSAGE, e.as_ref()).into_response()),
+    };
+
+    Ok(Redirect::temporary(url.as_str()).into_response())
+  }
+
+  async fn resolve_uncached(&self, cache_key: &ResolveCacheKey) -> anyhow::Result<String> {
+    let cid = match with_bilibili_headers(self.client.get(format!(
+      "https://api.bilibili.com/x/player/pagelist?bvid={}",
+      cache_key.bvid
+    )))
+    .send()
+    .await
+    {
+      Ok(x) => x,
+      Err(e) => bail!("Failed to get cid: {}", e),
+    };
+    let strings = match cid.text().await {
+      Ok(x) => x,
+      Err(e) => bail!("Failed to parse cid response as UTF8: {}", e),
+    };
+    let cid = match serde_json::from_str::<serde_json::Value>(&strings) {
+      Ok(x) => x,
+      Err(_) => bail!("Failed to parse cid response: {}", &strings),
+    };
+
+    let page_index = cache_key
+      .p
+      .checked_sub(1)
+      .ok_or_else(|| anyhow!("Failed to get cid from response: {}", cid))?;
+    let cid = match cid
+      .as_object()
+      .and_then(|x| x.get("data"))
+      .and_then(|x| x.as_array())
+      .and_then(|x| x.get(page_index))
+      .and_then(|x| x.as_object())
+      .and_then(|x| x.get("cid"))
+      .and_then(|x| x.as_number())
+    {
+      Some(x) => x.to_string(),
+      None => bail!("Failed to get cid from response: {}", cid),
+    };
+
+    // https://www.bilibili.com/opus/400555526268551002
+    // quality 120 = 4K
+    // quality 116 = 1080P60
+    // quality 112 = 1080P+
+    // quality 80 = 1080P
+    // quality 74 = 720P60
+    // quality 64 = 720P
+    // quality 32 = 480P
+    // quality 16 = 360P
+    self.resolve_playurl(&cache_key.bvid, &cid).await
+  }
+
+  async fn resolve_playurl(&self, bv: &str, cid: &str) -> anyhow::Result<String> {
+    let preferred_quality = self.quality_cache.get(bv).await.unwrap_or(DEFAULT_QUALITY);
+    let mut tried_qualities = Vec::new();
+    let mut errors = Vec::new();
+
+    let (first_quality, first_playurl) =
+      match request_playurl(&self.client, bv, cid, preferred_quality).await {
+        Ok(x) => {
+          tried_qualities.push(preferred_quality);
+          (preferred_quality, x)
+        }
+        Err(e) if preferred_quality != DEFAULT_QUALITY => {
+          errors.push(format!(
+            "quality {} playurl request failed: {}",
+            preferred_quality, e
+          ));
+          tried_qualities.push(preferred_quality);
+
+          match request_playurl(&self.client, bv, cid, DEFAULT_QUALITY).await {
+            Ok(x) => {
+              tried_qualities.push(DEFAULT_QUALITY);
+              (DEFAULT_QUALITY, x)
+            }
+            Err(e) => {
+              errors.push(format!(
+                "quality {} playurl request failed: {}",
+                DEFAULT_QUALITY, e
+              ));
+              bail!("{}", errors.join("; "));
+            }
+          }
+        }
+        Err(e) => {
+          bail!(
+            "quality {} playurl request failed: {}",
+            preferred_quality,
+            e
+          );
+        }
+      };
+
+    let mut should_sleep_before_next_head = false;
+
+    if let Some(url) = extract_durl_url(&first_playurl) {
+      match validate_video_url(&self.client, &url).await {
+        Ok(()) => {
+          self
+            .quality_cache
+            .insert(bv.to_string(), first_quality)
+            .await;
+          return Ok(url);
+        }
+        Err(e) => {
+          errors.push(format!("quality {} HEAD failed: {}", first_quality, e));
+        }
+      }
+      should_sleep_before_next_head = true;
+    } else {
+      errors.push(format!(
+        "quality {} response missing .data.durl[0].url",
+        first_quality
+      ));
+    }
+
+    let mut retry_qualities = extract_accept_quality(&first_playurl);
+    if retry_qualities.is_empty() {
+      errors.push(format!(
+        "quality {} response missing .data.accept_quality",
+        first_quality
+      ));
+    }
+
+    if first_quality != DEFAULT_QUALITY && !retry_qualities.contains(&DEFAULT_QUALITY) {
+      retry_qualities.insert(0, DEFAULT_QUALITY);
+    }
+
+    for quality in retry_qualities {
+      if tried_qualities.contains(&quality) {
+        continue;
+      }
+      tried_qualities.push(quality);
+
+      let playurl = match request_playurl(&self.client, bv, cid, quality).await {
+        Ok(x) => x,
+        Err(e) => {
+          errors.push(format!("quality {} playurl request failed: {}", quality, e));
+          continue;
+        }
+      };
+      let Some(url) = extract_durl_url(&playurl) else {
+        errors.push(format!(
+          "quality {} response missing .data.durl[0].url",
+          quality
+        ));
+        continue;
+      };
+
+      if should_sleep_before_next_head {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+      }
+
+      match validate_video_url(&self.client, &url).await {
+        Ok(()) => {
+          self.quality_cache.insert(bv.to_string(), quality).await;
+          return Ok(url);
+        }
+        Err(e) => {
+          errors.push(format!("quality {} HEAD failed: {}", quality, e));
+        }
+      }
+      should_sleep_before_next_head = true;
+    }
+
+    if errors.is_empty() {
+      bail!("no quality candidates available");
+    }
+
+    bail!("{}", errors.join("; "))
+  }
+}
 
 fn with_bilibili_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
   request
@@ -100,7 +325,7 @@ fn extract_accept_quality(json: &serde_json::Value) -> Vec<u64> {
     .unwrap_or_default()
 }
 
-async fn is_video_url_head_ok(client: &reqwest::Client, url: &str) -> bool {
+async fn validate_video_url(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
   match client
     .head(url)
     .header("Accept", "*/*")
@@ -110,118 +335,13 @@ async fn is_video_url_head_ok(client: &reqwest::Client, url: &str) -> bool {
   {
     Ok(response) => {
       let status = response.status();
-      if !status.is_success() {
-        log::warn!("HEAD check failed with status {}", status);
+      if status.is_success() {
+        Ok(())
+      } else {
+        bail!("HEAD status {}", status)
       }
-      status.is_success()
     }
-    Err(e) => {
-      log::warn!("HEAD check failed: {}", e);
-      false
-    }
-  }
-}
-
-async fn resolve_playurl(client: &reqwest::Client, bv: &str, cid: &str) -> Option<String> {
-  let first_playurl = match request_playurl(client, bv, cid, DEFAULT_QUALITY).await {
-    Ok(x) => x,
-    Err(e) => {
-      log::warn!(
-        "Failed to get playurl for quality {}: {}",
-        DEFAULT_QUALITY,
-        e
-      );
-      return None;
-    }
-  };
-
-  if let Some(url) = extract_durl_url(&first_playurl) {
-    if is_video_url_head_ok(client, &url).await {
-      return Some(url);
-    }
-  } else {
-    log::warn!(
-      "Failed to parse .data.durl[0].url from {} quality playurl response",
-      DEFAULT_QUALITY
-    );
-  }
-
-  for quality in extract_accept_quality(&first_playurl) {
-    if quality == DEFAULT_QUALITY {
-      continue;
-    }
-
-    let playurl = match request_playurl(client, bv, cid, quality).await {
-      Ok(x) => x,
-      Err(e) => {
-        log::warn!("Failed to get playurl for quality {}: {}", quality, e);
-        continue;
-      }
-    };
-    let Some(url) = extract_durl_url(&playurl) else {
-      log::warn!(
-        "Failed to parse .data.durl[0].url from {} quality playurl response",
-        quality
-      );
-      continue;
-    };
-    if is_video_url_head_ok(client, &url).await {
-      return Some(url);
-    }
-  }
-
-  None
-}
-
-async fn bv_resolver(bv: String, p: usize) -> anyhow::Result<Response> {
-  let client = reqwest::Client::builder()
-    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
-    .build()
-    .map_err(|e| anyhow!(e))?;
-
-  let cid = match with_bilibili_headers(client.get(format!(
-    "https://api.bilibili.com/x/player/pagelist?bvid={}",
-    bv
-  )))
-  .send()
-  .await
-  {
-    Ok(x) => x,
-    Err(e) => bail!("Failed to get cid: {}", e),
-  };
-  let strings = match cid.text().await {
-    Ok(x) => x,
-    Err(e) => bail!("Failed to parse cid response as UTF8: {}", e),
-  };
-  let cid = match serde_json::from_str::<serde_json::Value>(&strings) {
-    Ok(x) => x,
-    Err(_) => bail!("Failed to parse cid response: {}", &strings),
-  };
-
-  let cid = match cid
-    .as_object()
-    .and_then(|x| x.get("data"))
-    .and_then(|x| x.as_array())
-    .and_then(|x| x.get(p - 1))
-    .and_then(|x| x.as_object())
-    .and_then(|x| x.get("cid"))
-    .and_then(|x| x.as_number())
-  {
-    Some(x) => x.to_string(),
-    None => bail!("Failed to get cid from response: {}", cid),
-  };
-  // https://www.bilibili.com/opus/400555526268551002
-  // quality 120 = 4K
-  // quality 116 = 1080P60
-  // quality 112 = 1080P+
-  // quality 80 = 1080P
-  // quality 74 = 720P60
-  // quality 64 = 720P
-  // quality 32 = 480P
-  // quality 16 = 360P
-  match resolve_playurl(&client, &bv, &cid).await {
-    Some(url) => Ok(Redirect::temporary(url.as_str()).into_response()),
-    None => Ok(RESOLVE_FAILURE_MESSAGE.into_response()),
+    Err(e) => bail!("HEAD request failed: {}", e),
   }
 }
 
@@ -237,29 +357,38 @@ async fn main() {
     .init();
 
   let opts = AppOpts::parse();
+  let bv_resolver = BvResolver::new().unwrap();
   let video_gw = VideoGateway::new(10000, Duration::from_secs(1800));
 
-  // build our application with a route
-  let app = Router::new()
-    .route("/", get(async move || Html("Hello from W")))
-    .route("/health", get(async move || Html("OK")))
+  let bv_router = Router::new()
     .route(
       "/{bvid}",
       get(
-        async move |params: Path<BvResolverParam>| -> Result<Response, AppError> {
-          Ok(bv_resolver(params.bvid.clone(), 1).await?)
+        async move |State(resolver): State<Arc<BvResolver>>,
+                    params: Path<BvResolverParam>|
+                    -> Result<Response, AppError> {
+          Ok(resolver.resolve(params.bvid.clone(), 1).await?)
         },
       ),
     )
     .route(
       "/{bvid}/{p}",
       get(
-        async move |params: Path<BvResolverParam>| -> Result<Response, AppError> {
+        async move |State(resolver): State<Arc<BvResolver>>,
+                    params: Path<BvResolverParam>|
+                    -> Result<Response, AppError> {
           let p = params.p.unwrap_or(1usize);
-          Ok(bv_resolver(params.bvid.clone(), p).await?)
+          Ok(resolver.resolve(params.bvid.clone(), p).await?)
         },
       ),
     )
+    .with_state(bv_resolver);
+
+  // build our application with a route
+  let app = Router::new()
+    .route("/", get(async move || Html("你好喵~这里是小袜子！")))
+    .route("/health", get(async move || Html("OK")))
+    .merge(bv_router)
     .nest("/video-gw", w_kiva_moe::video_gw::router(video_gw));
 
   // run it
